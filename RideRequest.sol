@@ -1,20 +1,29 @@
 pragma solidity ^0.4.17;
+
+contract RideRequestFactory {
+    address[] public rideRequests;
+
+    function createRideRequest(uint _prePayment, uint _postPayment, 
+                int _curLatitude, uint _curLatitudeDecimal,int _curLongitude, 
+                uint _curLongitudeDecimal, int _destLatitude, 
+                uint _destLatitudeDecimal, int _destLongitude, 
+                uint _destLongitudeDecimal) public payable {
+        RideRequest newRideRequest = new RideRequest(_prePayment, _postPayment, 
+        _curLatitude, _curLatitudeDecimal, _curLongitude, _curLongitudeDecimal,
+        _destLatitude, _destLatitudeDecimal, _destLongitude, 
+        _destLongitudeDecimal, msg.sender);
+        newRideRequest.initializeRideRequest.value(msg.value)();
+        rideRequests.push(newRideRequest);
+    }
+
+    function getRideRequests() public view returns (address[]) {
+        return rideRequests;
+    }
+}
+
 contract RideRequest {
     
-    //////////////////////// NOTES /////////////////////////////////////////////
-    // It would be ideal to use structs, but currently tuples are not supported
-    // in public calls :,(
-    // struct Requester {
-    //     address requesterAddress;
-    //     Coordinate location;
-    // }
-    
-    // struct DriverOffer {
-    //     address driverAddress;
-    //     Coordinate location;
-    // }
-    
-    enum State { CREATED, ACCEPTED, STARTED, COMPLETED, CANCELLED, REFUNDED }
+    enum State { CREATED, INITIALIZED, ACCEPTED, STARTED, COMPLETED, CANCELLED, REFUNDED }
     
     struct Coordinate {
         int latitude;
@@ -29,17 +38,14 @@ contract RideRequest {
     // Requester
     address public requester;
     Coordinate public requesterLocation;
-    string public requesterPhoneNumber;
-    
+
     // Selected drive offer
     address public driver;
     Coordinate public driverLocation;
-    string public driverPhoneNumber;
-    
+
     // Available drive offers
     address[] public possibleDrivers;
     mapping (address => Coordinate) public possibleDriversLocations;
-    mapping (address => string) public possibleDriversPhoneNumbers;
 
     // Payment
     uint public preTripPayment;
@@ -51,16 +57,14 @@ contract RideRequest {
     uint MAX_OFFERS = 5; 
     uint NOT_AN_OFFER = 9999;
 
-    constructor(uint _prePayment, uint _postPayment, string _phoneNumber, 
-                int _curLatitude, uint _curLatitudeDecimal,int _curLongitude, 
+    constructor(uint _prePayment, uint _postPayment, int _curLatitude, 
+                uint _curLatitudeDecimal,int _curLongitude, 
                 uint _curLongitudeDecimal, int _destLatitude, 
                 uint _destLatitudeDecimal, int _destLongitude, 
-                uint _destLongitudeDecimal) public payable {
-        require(_prePayment + _postPayment == msg.value);
+                uint _destLongitudeDecimal, address _requester) public payable {
         preTripPayment = _prePayment;
         postTripPayment = _postPayment;
-        requesterPhoneNumber = _phoneNumber;
-                    
+
         Coordinate memory curLocation = Coordinate({
             latitude: _curLatitude,
             latitudeDecimal: _curLatitudeDecimal,
@@ -68,7 +72,7 @@ contract RideRequest {
             longitudeDecimal: _curLongitudeDecimal
         });
         
-        requester = msg.sender;
+        requester = _requester;
         requesterLocation = curLocation;
         
         destination = Coordinate({
@@ -84,6 +88,15 @@ contract RideRequest {
     //////////////////////////////
     //// Requester Functions ////
     ////////////////////////////
+    
+    /**
+     * Initializes the contract with ether.
+     */
+    function initializeRideRequest() public payable {
+        require(msg.value >= preTripPayment + postTripPayment);
+        require(state == State.CREATED);
+        state = State.INITIALIZED;
+    }
     
     /**
      * Called by the requester to signify the ride has been COMPLETED,
@@ -111,10 +124,9 @@ contract RideRequest {
      */
     function acceptDriverOffer(uint _driverChoice) public requesterAccess {
         address driverAddress = possibleDrivers[_driverChoice];
-        require(isDriver(driverAddress) && state == State.CREATED);
+        require(isDriver(driverAddress) && state == State.INITIALIZED);
         driver = possibleDrivers[_driverChoice];
         driverLocation = possibleDriversLocations[driverAddress];
-        driverPhoneNumber = possibleDriversPhoneNumbers[driverAddress];
         state = State.ACCEPTED;
     }
     
@@ -124,7 +136,9 @@ contract RideRequest {
      * the driver.
      */
     function cancelRequest() public requesterAccess {
-        require(state == State.CREATED || state == State.REFUNDED);
+        require(state == State.INITIALIZED 
+                || state == State.REFUNDED 
+                || state == State.CREATED);
         selfdestruct(requester);
     }
     
@@ -135,14 +149,14 @@ contract RideRequest {
     
     /**
      * While contract is in the CREATED state, a driver can create 
-     * a drive offer with their phone number and current location.
+     * a drive offer with their current location.
      */
-    function createDriveOffer(string _phoneNumber, int _curLatitude, 
-                              uint _curLatitudeDecimal, int _curLongitude, 
-                              uint _curLongitudeDecimal) public {
+    function createDriveOffer(int _curLatitude, uint _curLatitudeDecimal, 
+                              int _curLongitude, uint _curLongitudeDecimal) 
+                              public {
         require(possibleDrivers.length < MAX_OFFERS 
                 && !isDriver(msg.sender) 
-                && state == State.CREATED);
+                && state == State.INITIALIZED);
         
         Coordinate memory curLocation = Coordinate({
             latitude: _curLatitude,
@@ -153,7 +167,6 @@ contract RideRequest {
         
         possibleDrivers.push(msg.sender);
         possibleDriversLocations[msg.sender] = curLocation;
-        possibleDriversPhoneNumbers[msg.sender] = _phoneNumber;
     }
     
     /**
@@ -161,11 +174,9 @@ contract RideRequest {
      * removes offer from offer list.
      */
     function cancelDriveOffer() public {
-        require(state == State.CREATED);
         uint indexOfOffer = findDriveOffer(msg.sender);
-        if (indexOfOffer != NOT_AN_OFFER) {
-            removeDriveOffer(indexOfOffer);
-        }
+        require(state == State.INITIALIZED && indexOfOffer != NOT_AN_OFFER);
+        removeDriveOffer(indexOfOffer);
     }
     
     /**
