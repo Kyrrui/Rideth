@@ -1,6 +1,19 @@
 pragma solidity ^0.4.17;
 contract RideRequest {
     
+    //////////////////////// NOTES /////////////////////////////////////////////
+    // It would be ideal to use structs, but currently tuples are not supported
+    // in public calls :,(
+    // struct Requester {
+    //     address requesterAddress;
+    //     Coordinate location;
+    // }
+    
+    // struct DriverOffer {
+    //     address driverAddress;
+    //     Coordinate location;
+    // }
+    
     enum State { CREATED, ACCEPTED, STARTED, COMPLETED, CANCELLED, REFUNDED }
     
     struct Coordinate {
@@ -10,38 +23,27 @@ contract RideRequest {
         uint longitudeDecimal;
     }
     
-    // It would be ideal to use structs, but currently tuples are not supported
-    // in public calls :,(
-    // struct Requester {
-    //     address requesterAddress;
-    //     Coordinate location;
-    // }
-    
-    // Since tuples can be called internally, we will use this for keeping 
-    // track of the list of drive offers
-    struct DriverOffer {
-        address driverAddress;
-        Coordinate location;
-    }
-    
     // Destination Coordinates
     Coordinate public destination;
     
     // Requester
-    // Requester public requester;
-    address requester;
-    Coordinate requesterLocation;
+    address public requester;
+    Coordinate public requesterLocation;
+    string public requesterPhoneNumber;
     
     // Selected drive offer
-    // DriverOffer public driverOffer;
-    address driver;
-    Coordinate driverLocation;
+    address public driver;
+    Coordinate public driverLocation;
+    string public driverPhoneNumber;
     
     // Available drive offers
-    DriverOffer[] public driverOffers;
-    
+    address[] public possibleDrivers;
+    mapping (address => Coordinate) public possibleDriversLocations;
+    mapping (address => string) public possibleDriversPhoneNumbers;
+
     // Payment
-    uint public payment;
+    uint public preTripPayment;
+    uint public postTripPayment;
     
     // State of contract
     State public state;
@@ -49,10 +51,15 @@ contract RideRequest {
     uint MAX_OFFERS = 5; 
     uint NOT_AN_OFFER = 9999;
 
-    constructor(int _curLatitude, uint _curLatitudeDecimal, int _curLongitude, 
+    constructor(uint _prePayment, uint _postPayment, string _phoneNumber, 
+                int _curLatitude, uint _curLatitudeDecimal,int _curLongitude, 
                 uint _curLongitudeDecimal, int _destLatitude, 
                 uint _destLatitudeDecimal, int _destLongitude, 
                 uint _destLongitudeDecimal) public payable {
+        require(_prePayment + _postPayment == msg.value);
+        preTripPayment = _prePayment;
+        postTripPayment = _postPayment;
+        requesterPhoneNumber = _phoneNumber;
                     
         Coordinate memory curLocation = Coordinate({
             latitude: _curLatitude,
@@ -70,14 +77,47 @@ contract RideRequest {
             longitude: _destLongitude,
             longitudeDecimal: _destLongitudeDecimal
         });
-        
-        payment = msg.value;
+    
         state = State.CREATED;
     }
     
     //////////////////////////////
     //// Requester Functions ////
     ////////////////////////////
+    
+    /**
+     * Called by the requester to signify the ride has been COMPLETED,
+     * and unlocks post payment for the driver.
+     */
+    function completeRide() public requesterAccess {
+        require(state == State.STARTED);
+        state = State.COMPLETED;
+    }
+    
+    /**
+     * Called by the requester to start the ride when in the driver's car, 
+     * gives the driver the pre-payment and locks the post payment
+     * NOTE: Only a refund can given the requester his payment back from here.
+     */
+    function startRide() public requesterAccess {
+        require(state == State.ACCEPTED);
+        // Give the driver the pre-payment for pickup
+        driver.transfer(preTripPayment);
+        state = State.STARTED;
+    }
+    
+    /**
+     * Called by the requester to accept a driver offer.
+     */
+    function acceptDriverOffer(uint _driverChoice) public requesterAccess {
+        address driverAddress = possibleDrivers[_driverChoice];
+        require(isDriver(driverAddress) && state == State.CREATED);
+        driver = possibleDrivers[_driverChoice];
+        driverLocation = possibleDriversLocations[driverAddress];
+        driverPhoneNumber = possibleDriversPhoneNumbers[driverAddress];
+        state = State.ACCEPTED;
+    }
+    
     /**
      * Called by ride requester before an offer is ACCEPTED to cancel the 
      * request and refund all ether OR when the request has been REFUNDED by
@@ -93,10 +133,16 @@ contract RideRequest {
     ///// Driver Functions //////
     ////////////////////////////
     
-    function createDriveOffer(int _curLatitude, uint _curLatitudeDecimal, 
-                              int _curLongitude, uint _curLongitudeDecimal) 
-                              public {
-        require(driverOffers.length < MAX_OFFERS && !isDriver(msg.sender));
+    /**
+     * While contract is in the CREATED state, a driver can create 
+     * a drive offer with their phone number and current location.
+     */
+    function createDriveOffer(string _phoneNumber, int _curLatitude, 
+                              uint _curLatitudeDecimal, int _curLongitude, 
+                              uint _curLongitudeDecimal) public {
+        require(possibleDrivers.length < MAX_OFFERS 
+                && !isDriver(msg.sender) 
+                && state == State.CREATED);
         
         Coordinate memory curLocation = Coordinate({
             latitude: _curLatitude,
@@ -105,11 +151,9 @@ contract RideRequest {
             longitudeDecimal: _curLongitudeDecimal
         });
         
-        DriverOffer memory newOffer = DriverOffer({
-            driverAddress: msg.sender,
-            location: curLocation
-        });
-        driverOffers.push(newOffer);
+        possibleDrivers.push(msg.sender);
+        possibleDriversLocations[msg.sender] = curLocation;
+        possibleDriversPhoneNumbers[msg.sender] = _phoneNumber;
     }
     
     /**
@@ -129,8 +173,16 @@ contract RideRequest {
      * Refunds the requester.
      */
     function refundRequest() public driverAccess {
-        require(state == State.STARTED);
         state = State.REFUNDED;
+    }
+    
+    /**
+     * Called by the driver when the ride is COMPLETED, withdrawing remaining
+     * ETH from contract.
+     */
+    function recievePayment() public driverAccess {
+        require(state == State.COMPLETED);
+        selfdestruct(driver);
     }
     
     ///////////////////////////////////
@@ -149,22 +201,28 @@ contract RideRequest {
         return isADriver;
     }
     
-    
+    /**
+     * Find the driver offer in the possibleDriver list 
+     * or return NOT_AN_OFFER (== 9999)
+     */
     function findDriveOffer(address _driverAddress) private view returns(uint) {
-        for (uint i; i < driverOffers.length; i++) {
-            if (driverOffers[i].driverAddress == _driverAddress) {
+        for (uint i; i < possibleDrivers.length; i++) {
+            if (possibleDrivers[i] == _driverAddress) {
                 return i;
             }
         }
         return NOT_AN_OFFER;
     }
     
-    function removeDriveOffer(uint index) private returns(DriverOffer[]) {
-        if (index >= driverOffers.length) return;
-        for (uint i = index; i<driverOffers.length-1; i++){
-            driverOffers[i] = driverOffers[i+1];
+    /**
+     * Remove driver offer from the possibleDrivers list
+     */
+    function removeDriveOffer(uint index) private {
+        require(index < possibleDrivers.length);
+        for (uint i = index; i<possibleDrivers.length-1; i++){
+            possibleDrivers[i] = possibleDrivers[i+1];
         }
-        driverOffers.length--;
+        possibleDrivers.length--;
     }
     
     //////////////////////////////
